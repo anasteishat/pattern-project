@@ -5,13 +5,21 @@
         "roles": [
             "admin",
             "user"
-        ]
+        ],
+        "secret_question": "What breed is your dog?",
+        "secret_answer": "labrador",
+        "failed_attempts": 0,
+        "blocked": false
     },
     {
         "username": "anasteishat",
         "password": "anakonda22",
         "roles": [
             "user"
-        ]
+        ],
+        "secret_question": "What is your favorite time of year?",
+        "secret_answer": "Summer",
+        "failed_attempts": 0,
+        "blocked": false
     }
 ]

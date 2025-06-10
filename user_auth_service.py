@@ -1,6 +1,9 @@
 import json
 from abc import ABC, abstractmethod
 
+MAX_FAILED_ATTEMPTS = 3
+USER_FILE = 'users.json'
+
 # ===== Strategy: Authentication Methods =====
 class AuthStrategy(ABC):
     @abstractmethod
@@ -17,39 +20,90 @@ class OAuthAuth(AuthStrategy):
 
 # ===== Factory Method: Users =====
 class User(ABC):
-    def __init__(self, username, password, roles=None):
+    def __init__(self, username, password, roles=None, secret_question=None, secret_answer=None,
+                 failed_attempts=0, blocked=False):
         self.username = username
         self.password = password
         self.roles = roles or ['user']
+        self.secret_question = secret_question
+        self.secret_answer = secret_answer
+        self.failed_attempts = failed_attempts
+        self.blocked = blocked
 
     def __str__(self):
+        status = ' (BLOCKED)' if self.blocked else ''
         roles_str = ', '.join(self.roles)
-        return f'User: {self.username} [{roles_str}]'
+        return f'User: {self.username} [{roles_str}]{status}'
     
     def has_role(self, role):
         return role in self.roles
+    
+    def to_dict(self):
+        return {
+            'username': self.username,
+            'password': self.password,
+            'roles': self.roles,
+            'secret_question': self.secret_question,
+            'secret_answer': self.secret_answer,
+            'failed_attempts': self.failed_attempts,
+            'blocked': self.blocked
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            d['username'], d['password'], d.get('roles', ['user']),
+            d.get('secret_question'), d.get('secret_answer'),
+            d.get('failed_attempts', 0), d.get('blocked', False)
+        )
 
 class Admin(User):
-    def __init__(self, username, password):
-        super().__init__(username, password, roles=['admin', 'user'])
+    def __init__(self, username, password, secret_question=None, secret_answer=None,
+                 failed_attempts=0, blocked=False):
+        super().__init__(username, password, ['admin', 'user'], secret_question, secret_answer, failed_attempts, blocked)
 
     def __str__(self):
-        return f'Admin: {self.username} [{", ".join(self.roles)}]'
+        status = ' (BLOCKED)' if self.blocked else ''
+        return f'Admin: {self.username} [{", ".join(self.roles)}]{status}'
 
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            d['username'],
+            d['password'],
+            d.get('secret_question'),
+            d.get('secret_answer'),
+            d.get('failed_attempts', 0),
+            d.get('blocked', False)
+        )
+    
 class UserFactory:
     @staticmethod
-    def create_user(user_type, username, password):
+    def create_user(user_type, username, password, secret_question, secret_answer):
         if user_type == "admin":
-            return Admin(username, password)
-        return UserImpl(username, password)
+            return Admin(username, password, secret_question, secret_answer)
+        return UserImpl(username, password, secret_question, secret_answer)
 
 class UserImpl(User):
-    def __init__(self, username, password):
-        super().__init__(username, password, roles=['user'])
+    def __init__(self, username, password, secret_question=None, secret_answer=None,
+                 failed_attempts=0, blocked=False):
+        super().__init__(username, password, ['user'], secret_question, secret_answer, failed_attempts, blocked)
 
     def __str__(self):
-        return f'Regular User: {self.username} [{", ".join(self.roles)}]'
+        status = ' (BLOCKED)' if self.blocked else ''
+        return f'Regular User: {self.username} [{", ".join(self.roles)}]{status}'
 
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            d['username'],
+            d['password'],
+            d.get('secret_question'),
+            d.get('secret_answer'),
+            d.get('failed_attempts', 0),
+            d.get('blocked', False)
+        )
+    
 # ===== Singleton: User Session =====
 class Session:
     __instance = None
@@ -76,15 +130,15 @@ class Session:
 
 # ===== User Manager (SOLID: Single Responsibility) =====
 class UserManager:
-    def __init__(self, filename='users.json'):
+    def __init__(self, filename=USER_FILE):
         self.filename = filename
         self.users = {}
         self.load_users()
 
-    def register(self, user_type, username, password):
+    def register(self, user_type, username, password, secret_question, secret_answer):
         if username in self.users:
             raise Exception("Username already exists!")
-        user = UserFactory.create_user(user_type, username, password)
+        user = UserFactory.create_user(user_type, username, password, secret_question, secret_answer)
         self.users[username] = user
         self.save_users()
         return user
@@ -97,28 +151,19 @@ class UserManager:
             with open(self.filename, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 for u in data:
-                    roles = u.get('roles', ['user'])
-                    # Restore correct class based on roles
-                    if 'admin' in roles:
-                        user = Admin(u['username'], u['password'])
+                    if 'admin' in u.get('roles', []):
+                        user = Admin.from_dict(u)
                     else:
-                        user = UserImpl(u['username'], u['password'])
-                    user.roles = roles
-                    self.users[u['username']] = user
+                        user = UserImpl.from_dict(u)
+                    self.users[user.username] = user
         except FileNotFoundError:
-            # On first run - create default admin
-            default_admin = Admin('admin', 'adminpass')
-            self.users['admin'] = default_admin
+            # Default admin
+            admin = Admin('admin', 'adminpass', 'First pet name?', 'admin')
+            self.users['admin'] = admin
             self.save_users()
 
     def save_users(self):
-        to_save = []
-        for user in self.users.values():
-            to_save.append({
-                'username': user.username,
-                'password': user.password,
-                'roles': user.roles
-            })
+        to_save = [user.to_dict() for user in self.users.values()]
         with open(self.filename, 'w', encoding='utf-8') as f:
             json.dump(to_save, f, indent=4)
 
@@ -126,6 +171,21 @@ class UserManager:
         user = self.get_user(username)
         if user and role not in user.roles:
             user.roles.append(role)
+            self.save_users()
+            return True
+        return False
+    
+    def reset_failed_attempts(self, username):
+        user = self.get_user(username)
+        if user:
+            user.failed_attempts = 0
+            user.blocked = False
+            self.save_users()
+
+    def set_new_password(self, username, new_password):
+        user = self.get_user(username)
+        if user:
+            user.password = new_password
             self.save_users()
             return True
         return False
@@ -143,8 +203,10 @@ def main():
             utype = input("Type (user/admin): ").strip().lower()
             uname = input("Username: ")
             upass = input("Password: ")
+            sq = input("Set your secret question (e.g. Your pet's name?): ")
+            sa = input("Set your secret answer: ").strip().lower()
             try:
-                user_manager.register(utype, uname, upass)
+                user_manager.register(utype, uname, upass, sq, sa)
                 print("User created successfully.")
             except Exception as ex:
                 print("Error:", ex)
@@ -154,6 +216,9 @@ def main():
             user = user_manager.get_user(uname)
             if not user:
                 print("User not found.")
+                continue
+            if user.blocked:
+                print("Account is blocked due to too many failed login attempts. Please reset your password.")
                 continue
 
             if method == "password":
@@ -171,8 +236,16 @@ def main():
             if strategy.authenticate(user, data):
                 session.login(user)
                 print(f"Login successful! Welcome, {user}")
+                user.failed_attempts = 0
+                user_manager.save_users()
             else:
-                print("Invalid login data.")
+                user.failed_attempts += 1
+                if user.failed_attempts >= MAX_FAILED_ATTEMPTS:
+                    user.blocked = True
+                    print("Too many failed attempts. Account is now BLOCKED!")
+                else:
+                    print(f"Invalid login data. Attempts left: {MAX_FAILED_ATTEMPTS - user.failed_attempts}")
+                user_manager.save_users()
         elif action == "logout":
             session.logout()
             print("You have been logged out.")
@@ -193,12 +266,21 @@ def main():
                 print(f"Role '{role}' added to {target}.")
             else:
                 print("Failed to add role (user not found or role exists).")
-        elif action == "restricted":
-            user = session.get_user()
-            if user and user.has_role('admin'):
-                print("Admin-only command executed!")
+        elif action == "reset_password":
+            uname = input("Username: ")
+            user = user_manager.get_user(uname)
+            if not user:
+                print("User not found.")
+                continue
+            print(f"Secret question: {user.secret_question}")
+            answer = input("Answer: ").strip().lower()
+            if answer == (user.secret_answer or '').strip().lower():
+                new_password = input("Enter new password: ")
+                user_manager.set_new_password(uname, new_password)
+                user_manager.reset_failed_attempts(uname)
+                print("Password reset successfully. You can now login.")
             else:
-                print("You don't have permission for this action.")
+                print("Incorrect answer. Password not reset.")
         elif action == "exit":
             print("Goodbye!")
             break
